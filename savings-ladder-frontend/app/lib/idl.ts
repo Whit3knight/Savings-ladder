@@ -3,6 +3,7 @@ export const IDL = {
   name: 'savings_ladder',
   metadata: {
   address: "4xgharpczryhKNFB9KpqhuCswggM6mdLve8epAr7k2Q7"
+  },
   instructions: [
     {
       name: 'createGroup',
