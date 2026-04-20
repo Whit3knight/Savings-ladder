@@ -2,7 +2,10 @@ export const IDL = {
   version: '0.1.0',
   name: 'savings_ladder',
   metadata: {
-  address: "4xgharpczryhKNFB9KpqhuCswggM6mdLve8epAr7k2Q7"
+  address: "4xgharpczryhKNFB9KpqhuCswggM6mdLve8epAr7k2Q7",
+  name: "savings_ladder",
+  version: "0.1.0",
+  spec: "0.1.0"
   },
   instructions: [
     {
