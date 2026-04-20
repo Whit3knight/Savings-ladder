@@ -1,0 +1,5 @@
+{
+  "buildCommand": "cd savings-ladder-frontend && npm run build",
+  "outputDirectory": "savings-ladder-frontend/.next",
+  "framework": "nextjs"
+}
