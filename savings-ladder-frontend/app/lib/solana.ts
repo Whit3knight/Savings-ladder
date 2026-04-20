@@ -50,7 +50,7 @@ export function getProvider(wallet: any): AnchorProvider {
 export function getProgram(wallet: any): Program {
   const provider = getProvider(wallet);
   const idlWithAddress = { ...IDL, address: PROGRAM_ID.toBase58() };
-  return new Program(idlWithAddress as Idl, provider);
+  return new Program(idlWithAddress as unknown as any, provider);
 }
 
 export async function getGroupPDA(authority: PublicKey, name: string): Promise<[PublicKey, number]> {
