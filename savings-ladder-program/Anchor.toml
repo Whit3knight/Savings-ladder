@@ -1,0 +1,20 @@
+[toolchain]
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.devnet]
+savings_ladder = "FdjoGvS6LpXJGL5rDP6rteg2ethHwbsxWeZ2P1PfQY8E"
+
+[programs.localnet]
+savings_ladder = "4xgharpczryhKNFB9KpqhuCswggM6mdLve8epAr7k2Q7"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "npx tsc --module commonjs --esModuleInterop true --skipLibCheck true --noEmitOnError false --outDir .anchor/tests tests/savings-ladder.ts; yarn mocha .anchor/tests/savings-ladder.js --timeout 1000000"
+
+[hooks]

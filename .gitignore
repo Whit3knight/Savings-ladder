@@ -1,0 +1,62 @@
+# --- KEAMANAN KETAT (SENSITIVE DATA) ---
+.env
+.env.local
+.env.production
+.env.development
+.env.test
+*.env.*
+*.key
+*.pem
+secrets.*
+
+# --- SOLANA & ANCHOR (BLOCKCHAIN) ---
+# Jangan hapus baris ini, kunci wallet sangat berbahaya jika bocor
+**/target/
+**/*.so
+**/*.deploy.json
+**/.anchor/
+**/wallet.json
+**/id.json
+**/keypair.json
+node_wallet.json
+deploy-keypair.json
+
+# --- NEXT.JS / NODE.JS (FRONTEND) ---
+node_modules/
+.next/
+out/
+build/
+dist/
+.vercel
+.turbo
+
+# --- TESTING (PLAYWRIGHT/JEST) ---
+playwright-report/
+test-results/
+coverage/
+.nyc_output
+
+# --- IDE & OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# --- LOGS ---
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- SUPABASE & DATABASE ---
+.supabase/functions/.env
+supabase/.temp/
