@@ -29,7 +29,7 @@ export default function GroupPortfolioPage() {
   const [activeTab, setActiveTab] = useState<Tab>('overview');
 
   const [stakeAccounts, setStakeAccounts] = useState<any[]>([]);
-  const [rewards, setRewards] = useState<number | null>(null);
+  const [rewards, setRewards] = useState<any | null>(null);
   const [totalStakedLamports, setTotalStakedLamports] = useState(0);
 
   const [showDepositModal, setShowDepositModal] = useState(false);

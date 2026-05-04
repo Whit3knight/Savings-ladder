@@ -15,7 +15,7 @@ export default function DashboardPage() {
   const [achievements, setAchievements] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [totalStaked, setTotalStaked] = useState(0);
-  const [rewards, setRewards] = useState<number | null>(null);
+  const [rewards, setRewards] = useState<any | null>(null);
 
   const [showJoinModal, setShowJoinModal] = useState(false);
   const [inviteCode, setInviteCode] = useState('');

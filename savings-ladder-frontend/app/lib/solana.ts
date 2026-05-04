@@ -396,9 +396,9 @@ export async function getUserStakeAccounts(walletPubkey: PublicKey): Promise<Arr
 
 /**
  * Fetch estimated staking rewards for a wallet address.
- * Returns rewards in lamports or null on error.
+ * Returns rewards object or null on error.
  */
-export async function fetchStakingRewards(walletPubkey: PublicKey): Promise<number | null> {
+export async function fetchStakingRewards(walletPubkey: PublicKey): Promise<any | null> {
   try {
     const { NativeStakingSDK, NativeStakingConfig } = await import(
       '@marinade.finance/native-staking-sdk'
