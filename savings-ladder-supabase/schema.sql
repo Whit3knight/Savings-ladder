@@ -148,6 +148,56 @@ BEGIN NEW.updated_at = NOW(); RETURN NEW; END; $$ LANGUAGE plpgsql;
 CREATE TRIGGER users_updated_at BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 CREATE TRIGGER groups_updated_at BEFORE UPDATE ON groups FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 
+-- ─── Fee System ──────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS treasury_balance (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    total_collected BIGINT DEFAULT 0,
+    treasury_balance BIGINT DEFAULT 0,
+    liquidity_balance BIGINT DEFAULT 0,
+    last_updated TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS fee_records (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    fee_type VARCHAR(20) CHECK (fee_type IN ('deposit', 'claim')),
+    group_id UUID NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    member_id UUID NOT NULL REFERENCES group_members(id) ON DELETE CASCADE,
+    amount_charged BIGINT NOT NULL,
+    treasury_amount BIGINT NOT NULL,
+    liquidity_amount BIGINT NOT NULL,
+    creator_amount BIGINT NOT NULL,
+    tx_hash TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS creator_rewards (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    group_id UUID NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    creator_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    total_earned BIGINT DEFAULT 0,
+    claimed_amount BIGINT DEFAULT 0,
+    last_claim_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(group_id)
+);
+
+ALTER TABLE deposits ADD COLUMN IF NOT EXISTS fee_charged BIGINT DEFAULT 0;
+ALTER TABLE group_members ADD COLUMN IF NOT EXISTS total_fees_paid BIGINT DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS idx_fee_records_group ON fee_records(group_id);
+CREATE INDEX IF NOT EXISTS idx_fee_records_created ON fee_records(created_at);
+CREATE INDEX IF NOT EXISTS idx_creator_rewards_group ON creator_rewards(group_id);
+
+ALTER TABLE treasury_balance ENABLE ROW LEVEL SECURITY;
+ALTER TABLE fee_records ENABLE ROW LEVEL SECURITY;
+ALTER TABLE creator_rewards ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY treasury_balance_all ON treasury_balance FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY fee_records_all ON fee_records FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY creator_rewards_all ON creator_rewards FOR ALL USING (true) WITH CHECK (true);
+
 -- ─── Auto achievements on deposit ─────────────────────────────────
 CREATE OR REPLACE FUNCTION check_achievements() RETURNS TRIGGER AS $$
 DECLARE v_user_id UUID; v_count INT; v_total BIGINT;

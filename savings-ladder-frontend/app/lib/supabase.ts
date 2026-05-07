@@ -204,6 +204,73 @@ export async function updateGroupStaked(groupId: string, totalStakedLamports: nu
   if (error) throw error;
 }
 
+// ─── Treasury & Fees ──────────────────────────────────────────────
+
+export async function getTreasuryBalance() {
+  const { data } = await supabase
+    .from('treasury_balance')
+    .select('*')
+    .order('last_updated', { ascending: false })
+    .limit(1);
+  return data?.[0];
+}
+
+export async function getFeeRecords(groupId?: string, limit = 20) {
+  let query = supabase.from('fee_records').select('*');
+  if (groupId) query = query.eq('group_id', groupId);
+  const { data } = await query
+    .order('created_at', { ascending: false })
+    .limit(limit);
+  return data;
+}
+
+export async function getCreatorRewards(groupId: string) {
+  const { data } = await supabase
+    .from('creator_rewards')
+    .select('*')
+    .eq('group_id', groupId);
+  return data?.[0];
+}
+
+export async function saveFeeRecord(record: {
+  fee_type: 'deposit' | 'claim';
+  group_id: string;
+  member_id: string;
+  amount_charged: number;
+  treasury_amount: number;
+  liquidity_amount: number;
+  creator_amount: number;
+  tx_hash?: string;
+}) {
+  const { data, error } = await supabase
+    .from('fee_records')
+    .insert(record)
+    .select()
+    .single();
+  if (error) throw error;
+
+  const existing = await getTreasuryBalance();
+  if (existing) {
+    await supabase
+      .from('treasury_balance')
+      .update({
+        total_collected: existing.total_collected + record.amount_charged,
+        treasury_balance: existing.treasury_balance + record.treasury_amount,
+        liquidity_balance: existing.liquidity_balance + record.liquidity_amount,
+        last_updated: new Date().toISOString(),
+      })
+      .eq('id', existing.id);
+  } else {
+    await supabase.from('treasury_balance').insert({
+      total_collected: record.amount_charged,
+      treasury_balance: record.treasury_amount,
+      liquidity_balance: record.liquidity_amount,
+    });
+  }
+
+  return data;
+}
+
 /** Update member's total_deposited and deposit_count */
 export async function updateMemberStats(
   memberId: string,

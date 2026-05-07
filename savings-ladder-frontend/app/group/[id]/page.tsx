@@ -11,7 +11,9 @@ import {
 import {
   getGroupDetails, getGroupDeposits, getGroupWithdrawals, getLeaderboard,
   getOrCreateUser, saveDeposit, saveWithdrawal, updateGroupStaked, updateMemberStats, saveMember,
+  saveFeeRecord,
 } from '../../lib/supabase';
+import { calculateDepositFee, calculateClaimFee, formatSOL, type FeeBreakdown } from '../../lib/utils';
 import { PublicKey, LAMPORTS_PER_SOL as WEB3_LAMPORTS } from '@solana/web3.js';
 
 type Tab = 'overview' | 'members' | 'history';
@@ -34,7 +36,11 @@ export default function GroupPortfolioPage() {
 
   const [showDepositModal, setShowDepositModal] = useState(false);
   const [showWithdrawModal, setShowWithdrawModal] = useState(false);
+  const [showClaimModal, setShowClaimModal] = useState(false);
   const [depositSol, setDepositSol] = useState('');
+  const [depositFeeBreakdown, setDepositFeeBreakdown] = useState<FeeBreakdown | null>(null);
+  const [claimAmount, setClaimAmount] = useState('');
+  const [claimFeeBreakdown, setClaimFeeBreakdown] = useState<FeeBreakdown | null>(null);
   const [withdrawType, setWithdrawType] = useState<'delayed' | 'instant'>('delayed');
   const [selectedStakeAccount, setSelectedStakeAccount] = useState('');
   const [withdrawAll, setWithdrawAll] = useState(false);
@@ -82,6 +88,22 @@ export default function GroupPortfolioPage() {
 
   useEffect(() => { load(); }, [load]);
   useEffect(() => { loadOnchain(); }, [loadOnchain]);
+
+  useEffect(() => {
+    if (depositSol && parseFloat(depositSol) > 0) {
+      setDepositFeeBreakdown(calculateDepositFee(parseFloat(depositSol) * 1e9));
+    } else {
+      setDepositFeeBreakdown(null);
+    }
+  }, [depositSol]);
+
+  useEffect(() => {
+    if (claimAmount && parseFloat(claimAmount) > 0) {
+      setClaimFeeBreakdown(calculateClaimFee(parseFloat(claimAmount) * 1e9));
+    } else {
+      setClaimFeeBreakdown(null);
+    }
+  }, [claimAmount]);
 
   // Auto-select the first available stake account when opening the withdraw modal
   useEffect(() => {
@@ -165,6 +187,20 @@ export default function GroupPortfolioPage() {
       await updateMemberStats(memberRow?.id ?? myMembership?.id, newTotalDeposited, newDepositCount, myMembership?.streak_count);
       await updateGroupStaked(groupId, newGroupStaked);
 
+      // Step 6 — Record fee
+      if (depositFeeBreakdown && memberRow?.id) {
+        await saveFeeRecord({
+          fee_type: 'deposit',
+          group_id: groupId,
+          member_id: memberRow.id,
+          amount_charged: depositFeeBreakdown.totalFee,
+          treasury_amount: depositFeeBreakdown.treasury,
+          liquidity_amount: depositFeeBreakdown.liquidity,
+          creator_amount: depositFeeBreakdown.creator,
+          tx_hash: txSignature,
+        }).catch(() => {});
+      }
+
       setTxMsg('✅ Deposit confirmed!');
       await Promise.all([load(), loadOnchain()]);
       setTimeout(() => { setShowDepositModal(false); setDepositSol(''); setTxMsg(''); }, 1500);
@@ -241,6 +277,33 @@ export default function GroupPortfolioPage() {
     }
   }
 
+  async function handleClaimRewards() {
+    if (!walletAddress || !group || !claimAmount || !claimFeeBreakdown) return;
+    setTxLoading(true); setTxMsg('Processing reward claim…');
+    try {
+      const netAmount = parseFloat(claimAmount) * 1e9 - claimFeeBreakdown.totalFee;
+
+      if (myMembership?.id) {
+        await saveFeeRecord({
+          fee_type: 'claim',
+          group_id: groupId,
+          member_id: myMembership.id,
+          amount_charged: claimFeeBreakdown.totalFee,
+          treasury_amount: claimFeeBreakdown.treasury,
+          liquidity_amount: claimFeeBreakdown.liquidity,
+          creator_amount: claimFeeBreakdown.creator,
+        }).catch(() => {});
+      }
+
+      setTxMsg(`✅ Reward claim recorded! Net: ${formatSOL(netAmount)} SOL`);
+      setTimeout(() => { setShowClaimModal(false); setClaimAmount(''); setTxMsg(''); }, 2000);
+    } catch (e: any) {
+      setTxMsg(`❌ ${e.message || 'Claim failed'}`);
+    } finally {
+      setTxLoading(false);
+    }
+  }
+
   if (loading) return (
     <div className="min-h-screen bg-[var(--bg)] flex items-center justify-center">
       <div className="animate-spin w-10 h-10 border-4 border-emerald-500 border-t-transparent rounded-full" />
@@ -285,12 +348,15 @@ export default function GroupPortfolioPage() {
               </div>
             </div>
             {isConnected && myMembership && (
-              <div className="flex gap-3">
+              <div className="flex gap-3 flex-wrap">
                 <button id="deposit-sol-btn" onClick={() => setShowDepositModal(true)} className="btn-primary flex items-center gap-2">
                   ⬆️ Deposit SOL
                 </button>
                 <button id="withdraw-sol-btn" onClick={() => setShowWithdrawModal(true)} className="btn-outline flex items-center gap-2">
                   ⬇️ Withdraw
+                </button>
+                <button onClick={() => setShowClaimModal(true)} className="btn-outline flex items-center gap-2">
+                  🎁 Claim Rewards
                 </button>
               </div>
             )}
@@ -467,6 +533,28 @@ export default function GroupPortfolioPage() {
               <input id="deposit-amount-input" type="number" step="0.01" min="0.01" className="input-field text-lg" placeholder="1.0" value={depositSol} onChange={e => setDepositSol(e.target.value)} />
               {depositSol && <span className="text-xs text-emerald-600 mt-1 block">≈ {formatRupiah(parseFloat(depositSol || '0') * 2_400_000)}</span>}
             </div>
+            {depositFeeBreakdown && (
+              <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-xl text-sm">
+                <div className="flex justify-between mb-1">
+                  <span className="text-slate-600">Deposit amount</span>
+                  <span className="font-medium">{parseFloat(depositSol).toFixed(4)} SOL</span>
+                </div>
+                <div className="flex justify-between mb-1">
+                  <span className="text-slate-600">Fee (1%)</span>
+                  <span className="font-medium text-amber-700">+{formatSOL(depositFeeBreakdown.totalFee)} SOL</span>
+                </div>
+                <div className="border-t border-amber-200 my-2" />
+                <div className="flex justify-between font-semibold mb-2">
+                  <span>Total to charge</span>
+                  <span>{formatSOL(parseFloat(depositSol) * 1e9 + depositFeeBreakdown.totalFee)} SOL</span>
+                </div>
+                <div className="text-xs text-slate-500 space-y-0.5">
+                  <div className="flex justify-between"><span>Treasury (50%)</span><span>{formatSOL(depositFeeBreakdown.treasury)} SOL</span></div>
+                  <div className="flex justify-between"><span>Liquidity (30%)</span><span>{formatSOL(depositFeeBreakdown.liquidity)} SOL</span></div>
+                  <div className="flex justify-between"><span>Creator (20%)</span><span>{formatSOL(depositFeeBreakdown.creator)} SOL</span></div>
+                </div>
+              </div>
+            )}
             {txMsg && <div className={`mb-4 p-3 rounded-xl text-sm ${txMsg.startsWith('✅') ? 'bg-emerald-50 text-emerald-700' : txMsg.startsWith('❌') ? 'bg-red-50 text-red-700' : 'bg-blue-50 text-blue-700'}`}>{txMsg}</div>}
             <div className="flex gap-3">
               <button id="confirm-deposit-btn" onClick={handleDeposit} disabled={txLoading || !depositSol} className="btn-primary flex-1">
@@ -527,6 +615,48 @@ export default function GroupPortfolioPage() {
                 {txLoading ? <span className="flex items-center justify-center gap-2"><span className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full" />Processing…</span> : 'Confirm Withdraw'}
               </button>
               <button onClick={() => { setShowWithdrawModal(false); setTxMsg(''); }} className="btn-secondary" disabled={txLoading}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Claim Rewards Modal */}
+      {showClaimModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+          <div className="card-elevated max-w-md w-full animate-fade-scale">
+            <h2 className="text-xl font-bold mb-1">Claim Rewards</h2>
+            <p className="text-sm text-slate-500 mb-4">A 3% fee applies to all reward claims, split between Treasury, Liquidity Pool, and Group Creator.</p>
+            <div className="mb-4">
+              <label className="label">Reward Amount (SOL)</label>
+              <input type="number" step="0.0001" min="0.0001" className="input-field text-lg" placeholder="0.1" value={claimAmount} onChange={e => setClaimAmount(e.target.value)} />
+            </div>
+            {claimFeeBreakdown && (
+              <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-xl text-sm">
+                <div className="flex justify-between mb-1">
+                  <span className="text-slate-600">Gross reward</span>
+                  <span className="font-medium">{parseFloat(claimAmount).toFixed(4)} SOL</span>
+                </div>
+                <div className="flex justify-between mb-1">
+                  <span className="text-slate-600">Fee (3%)</span>
+                  <span className="font-medium text-amber-700">-{formatSOL(claimFeeBreakdown.totalFee)} SOL</span>
+                </div>
+                <div className="border-t border-amber-200 my-2" />
+                <div className="flex justify-between font-semibold mb-2">
+                  <span>You receive</span>
+                  <span className="text-emerald-600">{formatSOL(parseFloat(claimAmount) * 1e9 - claimFeeBreakdown.totalFee)} SOL</span>
+                </div>
+                <div className="text-xs text-slate-500 space-y-0.5">
+                  <div className="flex justify-between"><span>Treasury (50%)</span><span>{formatSOL(claimFeeBreakdown.treasury)} SOL</span></div>
+                  <div className="flex justify-between"><span>Liquidity (30%)</span><span>{formatSOL(claimFeeBreakdown.liquidity)} SOL</span></div>
+                  <div className="flex justify-between"><span>Creator (20%)</span><span>{formatSOL(claimFeeBreakdown.creator)} SOL</span></div>
+                </div>
+              </div>
+            )}
+            {txMsg && <div className={`mb-4 p-3 rounded-xl text-sm ${txMsg.startsWith('✅') ? 'bg-emerald-50 text-emerald-700' : txMsg.startsWith('❌') ? 'bg-red-50 text-red-700' : 'bg-blue-50 text-blue-700'}`}>{txMsg}</div>}
+            <div className="flex gap-3">
+              <button onClick={handleClaimRewards} disabled={txLoading || !claimAmount || !claimFeeBreakdown} className="btn-primary flex-1">
+                {txLoading ? <span className="flex items-center justify-center gap-2"><span className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full" />Processing…</span> : 'Confirm Claim'}
+              </button>
+              <button onClick={() => { setShowClaimModal(false); setClaimAmount(''); setTxMsg(''); }} className="btn-secondary" disabled={txLoading}>Cancel</button>
             </div>
           </div>
         </div>

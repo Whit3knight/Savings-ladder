@@ -5,11 +5,35 @@ declare_id!("FdjoGvS6LpXJGL5rDP6rteg2ethHwbsxWeZ2P1PfQY8E");
 pub const MAX_NAME_LEN: usize = 50;
 pub const MAX_STAKE_ACCOUNTS: usize = 50;
 
+pub const DEPOSIT_FEE_BPS: u64 = 100;
+pub const REWARD_CLAIM_FEE_BPS: u64 = 300;
+pub const BPS_DIVISOR: u64 = 10_000;
+pub const TREASURY_BPS: u64 = 5000;
+pub const LIQUIDITY_BPS: u64 = 3000;
+pub const CREATOR_BPS: u64 = 2000;
+
+fn calculate_fee(amount: u64, fee_bps: u64) -> Result<u64> {
+    let product = amount
+        .checked_mul(fee_bps)
+        .ok_or(error!(SavingsError::Overflow))?;
+    product
+        .checked_div(BPS_DIVISOR)
+        .ok_or(error!(SavingsError::Overflow))
+}
+
+fn distribute_fee(fee: u64) -> Result<(u64, u64, u64)> {
+    let treasury = calculate_fee(fee, TREASURY_BPS)?;
+    let liquidity = calculate_fee(fee, LIQUIDITY_BPS)?;
+    let creator = fee
+        .checked_sub(treasury + liquidity)
+        .ok_or(error!(SavingsError::Overflow))?;
+    Ok((treasury, liquidity, creator))
+}
+
 #[program]
 pub mod savings_ladder {
     use super::*;
 
-    /// Create a new group savings ledger (no vault — SOL stays in user's stake accounts)
     pub fn create_group(
         ctx: Context<CreateGroup>,
         name: String,
@@ -48,7 +72,6 @@ pub mod savings_ladder {
         Ok(())
     }
 
-    /// Join an existing group; creates Member PDA for this user
     pub fn join_group(ctx: Context<JoinGroup>) -> Result<()> {
         let group = &mut ctx.accounts.group;
         require!(group.is_active, SavingsError::GroupInactive);
@@ -62,6 +85,7 @@ pub mod savings_ladder {
         member.total_deposited = 0;
         member.deposit_count = 0;
         member.streak_count = 0;
+        member.total_fees_paid = 0;
         member.stake_accounts = vec![];
         member.join_date = Clock::get()?.unix_timestamp;
         member.is_active = true;
@@ -76,8 +100,6 @@ pub mod savings_ladder {
         Ok(())
     }
 
-    /// Record that a deposit (native stake) has occurred; called AFTER frontend SDK staking.
-    /// Adds the new stake_account pubkey to the member's tracked list.
     pub fn record_deposit(
         ctx: Context<RecordDeposit>,
         amount_lamports: u64,
@@ -104,8 +126,6 @@ pub mod savings_ladder {
             .deposit_count
             .checked_add(1)
             .ok_or(SavingsError::Overflow)?;
-
-        // Simple streak: increment (full streak logic is off-chain in Supabase)
         member.streak_count = member
             .streak_count
             .checked_add(1)
@@ -127,7 +147,6 @@ pub mod savings_ladder {
         Ok(())
     }
 
-    /// Record a withdrawal; removes stake_account from member's list.
     pub fn record_withdrawal(
         ctx: Context<RecordWithdrawal>,
         amount_lamports: u64,
@@ -145,17 +164,13 @@ pub mod savings_ladder {
             SavingsError::InsufficientBalance
         );
 
-        // Remove the stake account from the tracked list
         member.stake_accounts.retain(|&pk| pk != stake_account);
-
         member.total_deposited = member
             .total_deposited
             .checked_sub(amount_lamports)
             .ok_or(SavingsError::Overflow)?;
 
-        group.total_staked = group
-            .total_staked
-            .saturating_sub(amount_lamports);
+        group.total_staked = group.total_staked.saturating_sub(amount_lamports);
 
         emit!(WithdrawalRecordedEvent {
             group: group.key(),
@@ -167,7 +182,6 @@ pub mod savings_ladder {
         Ok(())
     }
 
-    /// Authority-only: record staking rewards distributed to this group
     pub fn distribute_rewards(ctx: Context<DistributeRewards>, amount: u64) -> Result<()> {
         require!(amount > 0, SavingsError::InvalidAmount);
 
@@ -193,7 +207,6 @@ pub mod savings_ladder {
         Ok(())
     }
 
-    /// Authority-only: deactivate the group
     pub fn close_group(ctx: Context<CloseGroup>) -> Result<()> {
         let group = &mut ctx.accounts.group;
         require!(
@@ -211,6 +224,206 @@ pub mod savings_ladder {
 
         Ok(())
     }
+
+    pub fn initialize_treasury(ctx: Context<InitializeTreasury>) -> Result<()> {
+        let treasury = &mut ctx.accounts.treasury;
+        treasury.total_collected = 0;
+        treasury.treasury_balance = 0;
+        treasury.liquidity_balance = 0;
+        treasury.bump = ctx.bumps.treasury;
+        Ok(())
+    }
+
+    pub fn charge_deposit_fee(
+        ctx: Context<ChargeDepositFee>,
+        amount_lamports: u64,
+        stake_account: Pubkey,
+    ) -> Result<()> {
+        require!(amount_lamports > 0, SavingsError::InvalidAmount);
+
+        // Cache keys and state before any mutable borrows
+        let group_key = ctx.accounts.group.key();
+        let group_authority = ctx.accounts.group.authority;
+        let group_is_active = ctx.accounts.group.is_active;
+        let member_is_active = ctx.accounts.member.is_active;
+        let stake_count = ctx.accounts.member.stake_accounts.len();
+        let payer_key = ctx.accounts.payer.key();
+        let creator_is_new = ctx.accounts.creator_rewards.group == Pubkey::default();
+
+        require!(group_is_active, SavingsError::GroupInactive);
+        require!(member_is_active, SavingsError::MemberInactive);
+        require!(stake_count < MAX_STAKE_ACCOUNTS, SavingsError::TooManyStakeAccounts);
+
+        let fee = calculate_fee(amount_lamports, DEPOSIT_FEE_BPS)?;
+        let (treasury_cut, liquidity_cut, creator_cut) = distribute_fee(fee)?;
+
+        require!(ctx.accounts.payer.lamports() >= fee, SavingsError::InsufficientFunds);
+
+        anchor_lang::system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                anchor_lang::system_program::Transfer {
+                    from: ctx.accounts.payer.to_account_info(),
+                    to: ctx.accounts.treasury.to_account_info(),
+                },
+            ),
+            fee,
+        )?;
+
+        {
+            let treasury = &mut ctx.accounts.treasury;
+            treasury.total_collected = treasury
+                .total_collected
+                .checked_add(fee)
+                .ok_or(SavingsError::Overflow)?;
+            treasury.treasury_balance = treasury
+                .treasury_balance
+                .checked_add(treasury_cut)
+                .ok_or(SavingsError::Overflow)?;
+            treasury.liquidity_balance = treasury
+                .liquidity_balance
+                .checked_add(liquidity_cut)
+                .ok_or(SavingsError::Overflow)?;
+        }
+
+        {
+            let creator_rewards = &mut ctx.accounts.creator_rewards;
+            if creator_is_new {
+                creator_rewards.group = group_key;
+                creator_rewards.creator_address = group_authority;
+                creator_rewards.total_earned = 0;
+                creator_rewards.claimed = 0;
+                creator_rewards.bump = ctx.bumps.creator_rewards;
+            }
+            creator_rewards.total_earned = creator_rewards
+                .total_earned
+                .checked_add(creator_cut)
+                .ok_or(SavingsError::Overflow)?;
+        }
+
+        {
+            let member = &mut ctx.accounts.member;
+            member.stake_accounts.push(stake_account);
+            member.total_deposited = member
+                .total_deposited
+                .checked_add(amount_lamports)
+                .ok_or(SavingsError::Overflow)?;
+            member.deposit_count = member
+                .deposit_count
+                .checked_add(1)
+                .ok_or(SavingsError::Overflow)?;
+            member.streak_count = member
+                .streak_count
+                .checked_add(1)
+                .ok_or(SavingsError::Overflow)?;
+            member.total_fees_paid = member
+                .total_fees_paid
+                .checked_add(fee)
+                .ok_or(SavingsError::Overflow)?;
+        }
+
+        ctx.accounts.group.total_staked = ctx
+            .accounts
+            .group
+            .total_staked
+            .checked_add(amount_lamports)
+            .ok_or(SavingsError::Overflow)?;
+
+        let total_collected = ctx.accounts.treasury.total_collected;
+        let treasury_balance = ctx.accounts.treasury.treasury_balance;
+        let liquidity_balance = ctx.accounts.treasury.liquidity_balance;
+
+        emit!(FeeCollectedEvent {
+            fee_type: 0,
+            total_fee: fee,
+            treasury_amount: treasury_cut,
+            liquidity_amount: liquidity_cut,
+            creator_amount: creator_cut,
+            group: group_key,
+            member: payer_key,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        emit!(TreasuryBalanceUpdated {
+            total_collected,
+            treasury_balance,
+            liquidity_balance,
+        });
+
+        Ok(())
+    }
+
+    pub fn claim_rewards_with_fee(
+        ctx: Context<ClaimRewardsWithFee>,
+        reward_amount: u64,
+    ) -> Result<()> {
+        require!(reward_amount > 0, SavingsError::InvalidAmount);
+
+        let group_key = ctx.accounts.group.key();
+        let member_key = ctx.accounts.withdrawal_authority.key();
+
+        let fee = calculate_fee(reward_amount, REWARD_CLAIM_FEE_BPS)?;
+        let (treasury_cut, liquidity_cut, creator_cut) = distribute_fee(fee)?;
+
+        require!(ctx.accounts.withdrawal_authority.lamports() >= fee, SavingsError::InsufficientFunds);
+
+        anchor_lang::system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                anchor_lang::system_program::Transfer {
+                    from: ctx.accounts.withdrawal_authority.to_account_info(),
+                    to: ctx.accounts.treasury.to_account_info(),
+                },
+            ),
+            fee,
+        )?;
+
+        {
+            let treasury = &mut ctx.accounts.treasury;
+            treasury.total_collected = treasury
+                .total_collected
+                .checked_add(fee)
+                .ok_or(SavingsError::Overflow)?;
+            treasury.treasury_balance = treasury
+                .treasury_balance
+                .checked_add(treasury_cut)
+                .ok_or(SavingsError::Overflow)?;
+            treasury.liquidity_balance = treasury
+                .liquidity_balance
+                .checked_add(liquidity_cut)
+                .ok_or(SavingsError::Overflow)?;
+        }
+
+        ctx.accounts.creator_rewards.total_earned = ctx
+            .accounts
+            .creator_rewards
+            .total_earned
+            .checked_add(creator_cut)
+            .ok_or(SavingsError::Overflow)?;
+
+        let total_collected = ctx.accounts.treasury.total_collected;
+        let treasury_balance = ctx.accounts.treasury.treasury_balance;
+        let liquidity_balance = ctx.accounts.treasury.liquidity_balance;
+
+        emit!(FeeCollectedEvent {
+            fee_type: 1,
+            total_fee: fee,
+            treasury_amount: treasury_cut,
+            liquidity_amount: liquidity_cut,
+            creator_amount: creator_cut,
+            group: group_key,
+            member: member_key,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        emit!(TreasuryBalanceUpdated {
+            total_collected,
+            treasury_balance,
+            liquidity_balance,
+        });
+
+        Ok(())
+    }
 }
 
 // ─────────────────────────────────────────────────
@@ -219,18 +432,18 @@ pub mod savings_ladder {
 
 #[account]
 pub struct Group {
-    pub authority: Pubkey,          // 32
-    pub name: String,               // 4 + MAX_NAME_LEN
-    pub target_amount: u64,         // 8
-    pub monthly_contribution: u64,  // 8
-    pub duration_months: u32,       // 4
-    pub max_members: u32,           // 4
-    pub total_members: u32,         // 4
-    pub total_staked: u64,          // 8  (lamports tracked by members)
-    pub total_rewards: u64,         // 8  (rewards recorded by authority)
-    pub is_active: bool,            // 1
-    pub created_at: i64,            // 8
-    pub bump: u8,                   // 1
+    pub authority: Pubkey,
+    pub name: String,
+    pub target_amount: u64,
+    pub monthly_contribution: u64,
+    pub duration_months: u32,
+    pub max_members: u32,
+    pub total_members: u32,
+    pub total_staked: u64,
+    pub total_rewards: u64,
+    pub is_active: bool,
+    pub created_at: i64,
+    pub bump: u8,
 }
 
 impl Group {
@@ -239,31 +452,57 @@ impl Group {
 
 #[account]
 pub struct Member {
-    pub group: Pubkey,              // 32
-    pub authority: Pubkey,          // 32
-    pub total_deposited: u64,       // 8
-    pub deposit_count: u32,         // 4
-    pub streak_count: u32,          // 4
-    pub stake_accounts: Vec<Pubkey>, // 4 + n*32 (dynamic, grown via realloc)
-    pub join_date: i64,             // 8
-    pub is_active: bool,            // 1
-    pub bump: u8,                   // 1
+    pub group: Pubkey,
+    pub authority: Pubkey,
+    pub total_deposited: u64,
+    pub deposit_count: u32,
+    pub streak_count: u32,
+    pub total_fees_paid: u64,
+    pub stake_accounts: Vec<Pubkey>,
+    pub join_date: i64,
+    pub is_active: bool,
+    pub bump: u8,
 }
 
 impl Member {
-    /// Compute required account space for n stake accounts
     pub fn space(n: usize) -> usize {
-        8      // discriminator
-        + 32   // group
-        + 32   // authority
-        + 8    // total_deposited
-        + 4    // deposit_count
-        + 4    // streak_count
-        + 4 + n * 32  // stake_accounts vec (4 = length prefix)
-        + 8    // join_date
-        + 1    // is_active
-        + 1    // bump
+        8       // discriminator
+        + 32    // group
+        + 32    // authority
+        + 8     // total_deposited
+        + 4     // deposit_count
+        + 4     // streak_count
+        + 8     // total_fees_paid
+        + 4 + n * 32  // stake_accounts
+        + 8     // join_date
+        + 1     // is_active
+        + 1     // bump
     }
+}
+
+#[account]
+pub struct Treasury {
+    pub total_collected: u64,
+    pub treasury_balance: u64,
+    pub liquidity_balance: u64,
+    pub bump: u8,
+}
+
+impl Treasury {
+    pub const SPACE: usize = 8 + 8 + 8 + 8 + 1 + 32;
+}
+
+#[account]
+pub struct CreatorRewards {
+    pub group: Pubkey,
+    pub creator_address: Pubkey,
+    pub total_earned: u64,
+    pub claimed: u64,
+    pub bump: u8,
+}
+
+impl CreatorRewards {
+    pub const SPACE: usize = 8 + 32 + 32 + 8 + 8 + 1 + 32;
 }
 
 // ─────────────────────────────────────────────────
@@ -367,6 +606,85 @@ pub struct CloseGroup<'info> {
     pub authority: Signer<'info>,
 }
 
+#[derive(Accounts)]
+pub struct InitializeTreasury<'info> {
+    #[account(
+        init,
+        payer = authority,
+        space = Treasury::SPACE,
+        seeds = [b"treasury"],
+        bump,
+    )]
+    pub treasury: Account<'info, Treasury>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ChargeDepositFee<'info> {
+    #[account(
+        mut,
+        seeds = [b"treasury"],
+        bump = treasury.bump,
+    )]
+    pub treasury: Account<'info, Treasury>,
+
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = CreatorRewards::SPACE,
+        seeds = [b"creator_rewards", group.key().as_ref()],
+        bump,
+    )]
+    pub creator_rewards: Account<'info, CreatorRewards>,
+
+    #[account(mut)]
+    pub group: Account<'info, Group>,
+
+    #[account(
+        mut,
+        seeds = [b"member", group.key().as_ref(), payer.key().as_ref()],
+        bump = member.bump,
+        realloc = Member::space(member.stake_accounts.len() + 1),
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub member: Account<'info, Member>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimRewardsWithFee<'info> {
+    #[account(
+        mut,
+        seeds = [b"treasury"],
+        bump = treasury.bump,
+    )]
+    pub treasury: Account<'info, Treasury>,
+
+    #[account(
+        mut,
+        seeds = [b"creator_rewards", group.key().as_ref()],
+        bump = creator_rewards.bump,
+    )]
+    pub creator_rewards: Account<'info, CreatorRewards>,
+
+    #[account(mut)]
+    pub group: Account<'info, Group>,
+
+    #[account(mut)]
+    pub withdrawal_authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
 // ─────────────────────────────────────────────────
 // ERRORS
 // ─────────────────────────────────────────────────
@@ -397,6 +715,10 @@ pub enum SavingsError {
     Overflow,
     #[msg("Unauthorized")]
     Unauthorized,
+    #[msg("Insufficient funds for fee")]
+    InsufficientFunds,
+    #[msg("Treasury account error")]
+    TreasuryError,
 }
 
 // ─────────────────────────────────────────────────
@@ -446,4 +768,23 @@ pub struct RewardsDistributedEvent {
 pub struct GroupClosedEvent {
     pub group: Pubkey,
     pub authority: Pubkey,
+}
+
+#[event]
+pub struct FeeCollectedEvent {
+    pub fee_type: u8,
+    pub total_fee: u64,
+    pub treasury_amount: u64,
+    pub liquidity_amount: u64,
+    pub creator_amount: u64,
+    pub group: Pubkey,
+    pub member: Pubkey,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct TreasuryBalanceUpdated {
+    pub total_collected: u64,
+    pub treasury_balance: u64,
+    pub liquidity_balance: u64,
 }

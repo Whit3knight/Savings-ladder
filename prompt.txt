@@ -1,0 +1,408 @@
+APPROVED SPECIFICATIONS:
+Fee Structure: 1% deposit fee (charged extra), 3% reward claim fee (charged extra)
+Distribution: 50% Treasury, 30% Liquidity Pool, 20% Group Creator
+Treasury Approach: Smart contract holds all fees via PDA (Solana)
+UI Flow: Show fee breakdown BEFORE user confirms transaction
+Timeline: 3 days for complete Phase 1 (smart contract + database + frontend)
+📋 DELIVERABLES (In Order):
+1. SMART CONTRACT UPDATES (savings-ladder-program/programs/savings_ladder/src/lib.rs)
+Add these constants at the top:
+
+pub const DEPOSIT_FEE_BPS: u64 = 100;           // 1% = 100 basis points
+pub const REWARD_CLAIM_FEE_BPS: u64 = 300;     // 3% = 300 basis points
+pub const BPS_DIVISOR: u64 = 10_000;
+pub const TREASURY_BPS: u64 = 5000;            // 50%
+pub const LIQUIDITY_BPS: u64 = 3000;           // 30%
+pub const CREATOR_BPS: u64 = 2000;             // 20%
+Add these new account structs:
+
+#[account]
+pub struct Treasury {
+	pub total_collected: u64,
+	pub treasury_balance: u64,
+	pub liquidity_balance: u64,
+	pub bump: u8,
+}
+
+#[account]
+pub struct CreatorRewards {
+	pub group: Pubkey,
+	pub creator_address: Pubkey,
+	pub total_earned: u64,
+	pub claimed: u64,
+	pub bump: u8,
+}
+Add helper functions:
+
+fn calculate_fee(amount: u64, fee_bps: u64) -> Result<u64> {
+	amount
+	.checked_mul(fee_bps)
+	.ok_or(SavingsError::Overflow)?
+	.checked_div(BPS_DIVISOR)
+	.ok_or(SavingsError::Overflow)
+}
+
+fn distribute_fee(fee: u64) -> Result<(u64, u64, u64)> {
+	let treasury = calculate_fee(fee, TREASURY_BPS)?;
+	let liquidity = calculate_fee(fee, LIQUIDITY_BPS)?;
+	let creator = fee.checked_sub(treasury + liquidity)
+	.ok_or(SavingsError::Overflow)?;
+	Ok((treasury, liquidity, creator))
+}
+Add new instruction: charge_deposit_fee
+
+Takes: amount_lamports, stake_account, payer
+Process:
+Calculate fee = amount * 1%
+Calculate splits (50/30/20)
+Transfer (amount + fee) from payer to system program
+Update Treasury account
+Update CreatorRewards for group
+Update Member & Group state
+Emit FeeCollectedEvent
+Context: Treasury PDA, CreatorRewards PDA, Member PDA, Group PDA
+Error handling: Overflow checks, authorization, inactive checks
+Add new instruction: claim_rewards_with_fee
+
+Takes: reward_amount, withdrawal_authority
+Process:
+Calculate fee = reward_amount * 3%
+Calculate splits
+Update Treasury
+Update CreatorRewards
+Transfer reward_amount to withdrawal_authority
+Emit RewardClaimedWithFeeEvent
+Add new events:
+
+#[event]
+pub struct FeeCollectedEvent {
+	pub fee_type: u8,
+	pub total_fee: u64,
+	pub treasury_amount: u64,
+	pub liquidity_amount: u64,
+	pub creator_amount: u64,
+	pub group: Pubkey,
+	pub member: Pubkey,
+	pub timestamp: i64,
+}
+
+#[event]
+pub struct TreasuryBalanceUpdated {
+	pub total_collected: u64,
+	pub treasury_balance: u64,
+	pub liquidity_balance: u64,
+}
+Add error codes:
+
+#[error_code]
+pub enum SavingsError {
+	// ... existing errors ...
+	#[msg("Insufficient funds for fee")]
+	InsufficientFunds,
+	#[msg("Treasury account error")]
+	TreasuryError,
+}
+Requirements:
+
+✅ All arithmetic uses checked_* operations
+✅ Treasury PDA uses seed: ["treasury"]
+✅ CreatorRewards PDA uses seed: ["creator_rewards", group_pubkey]
+✅ Test with anchor test (basic unit tests)
+✅ Compile without errors
+2. DATABASE SCHEMA (savings-ladder-supabase/schema.sql)
+Add new tables:
+
+CREATE TABLE IF NOT EXISTS treasury_balance (
+	id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+											 total_collected BIGINT DEFAULT 0,
+											 treasury_balance BIGINT DEFAULT 0,
+											 liquidity_balance BIGINT DEFAULT 0,
+											 last_updated TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS fee_records (
+	id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+										fee_type VARCHAR(20) CHECK (fee_type IN ('deposit', 'claim')),
+										group_id UUID NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+										member_id UUID NOT NULL REFERENCES group_members(id) ON DELETE CASCADE,
+										amount_charged BIGINT NOT NULL,
+										treasury_amount BIGINT NOT NULL,
+										liquidity_amount BIGINT NOT NULL,
+										creator_amount BIGINT NOT NULL,
+										tx_hash TEXT,
+										created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS creator_rewards (
+	id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+											group_id UUID NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+											creator_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+											total_earned BIGINT DEFAULT 0,
+											claimed_amount BIGINT DEFAULT 0,
+											last_claim_at TIMESTAMPTZ,
+											created_at TIMESTAMPTZ DEFAULT NOW(),
+											updated_at TIMESTAMPTZ DEFAULT NOW(),
+											UNIQUE(group_id)
+);
+
+CREATE INDEX idx_fee_records_group ON fee_records(group_id);
+CREATE INDEX idx_fee_records_created ON fee_records(created_at);
+CREATE INDEX idx_creator_rewards_group ON creator_rewards(group_id);
+Update existing tables:
+
+ALTER TABLE deposits ADD COLUMN IF NOT EXISTS fee_charged BIGINT DEFAULT 0;
+ALTER TABLE group_members ADD COLUMN IF NOT EXISTS total_fees_paid BIGINT DEFAULT 0;
+Requirements:
+
+✅ Use PostgreSQL syntax
+✅ Add RLS policies for fee_records (users can only see their own)
+✅ Create triggers to auto-update treasury_balance (optional, can be off-chain)
+3. FRONTEND - FEE CALCULATOR (savings-ladder-frontend/app/lib/utils.ts - NEW)
+// Fee calculation utilities
+export const DEPOSIT_FEE_BPS = 100;      // 1%
+export const CLAIM_FEE_BPS = 300;       // 3%
+export const BPS_DIVISOR = 10000;
+
+export const TREASURY_BPS = 5000;       // 50%
+export const LIQUIDITY_BPS = 3000;      // 30%
+export const CREATOR_BPS = 2000;        // 20%
+
+export interface FeeBreakdown {
+	totalFee: number;
+	treasury: number;
+	liquidity: number;
+	creator: number;
+}
+
+export function calculateDepositFee(amount: number): FeeBreakdown {
+	const totalFee = Math.floor((amount * DEPOSIT_FEE_BPS) / BPS_DIVISOR);
+	return distributeFee(totalFee);
+}
+
+export function calculateClaimFee(amount: number): FeeBreakdown {
+	const totalFee = Math.floor((amount * CLAIM_FEE_BPS) / BPS_DIVISOR);
+	return distributeFee(totalFee);
+}
+
+function distributeFee(fee: number): FeeBreakdown {
+	const treasury = Math.floor((fee * TREASURY_BPS) / BPS_DIVISOR);
+	const liquidity = Math.floor((fee * LIQUIDITY_BPS) / BPS_DIVISOR);
+	const creator = fee - treasury - liquidity;
+	
+	return { totalFee: fee, treasury, liquidity, creator };
+}
+
+export function formatSOL(lamports: number): string {
+	return (lamports / 1_000_000_000).toFixed(4);
+}
+4. FRONTEND - DEPOSIT UI (Update savings-ladder-frontend/app/group/[id]/page.tsx)
+Update deposit modal to:
+
+Add fee calculator when user enters amount
+Show fee breakdown UI:
+Deposit amount:     X SOL
+Fee (1%):          Y SOL
+─────────────────────────
+Total to charge:   X+Y SOL
+Fee breakdown:
+• Treasury (50%):    Y*0.5 SOL
+• Liquidity (30%):   Y*0.3 SOL
+• Creator (20%):     Y*0.2 SOL
+Update transaction to include fee amount
+Add confirmation before sending
+Code structure:
+
+const [depositAmount, setDepositAmount] = useState('');
+const [feeBreakdown, setFeeBreakdown] = useState<FeeBreakdown | null>(null);
+
+useEffect(() => {
+	if (depositAmount) {
+		const fee = calculateDepositFee(parseFloat(depositAmount) * 1e9);
+		setFeeBreakdown(fee);
+	}
+}, [depositAmount]);
+
+// In transaction:
+const totalCharge = (depositAmount * 1e9) + feeBreakdown.totalFee;
+// Call: charge_deposit_fee(amount_lamports, stake_account)
+Requirements:
+
+✅ Real-time fee calculation as user types
+✅ Show total SOL user will be charged
+✅ Display fee breakdown (50/30/20)
+✅ Disable submit if insufficient balance
+✅ Confirmation modal before transaction
+5. FRONTEND - CLAIM REWARDS UI (Update savings-ladder-frontend/app/group/[id]/page.tsx)
+Update rewards claim modal to:
+
+Show estimated fee (3%) on claimed amount
+Display net amount user will receive
+Fee breakdown same as deposit
+Confirmation before claiming
+Code:
+
+const handleClaimRewards = async () => {
+	const claimAmount = parseFloat(rewardAmount) * 1e9;
+	const fee = calculateClaimFee(claimAmount);
+	const netAmount = claimAmount - fee.totalFee;
+	
+	// Show confirmation with net amount
+	// Call: claim_rewards_with_fee(reward_amount)
+};
+6. FRONTEND - TREASURY DASHBOARD (NEW PAGE: savings-ladder-frontend/app/admin/treasury/page.tsx)
+Display:
+
+// Header
+Total Fees Collected (all-time): X SOL
+Current Treasury Balance: Y SOL
+Current Liquidity Balance: Z SOL
+
+// Charts
+Pie chart: Fee distribution (50/30/20)
+Line chart: Fees collected over time
+
+// Tables
+Recent fee transactions (last 20):
+- Type (deposit/claim), Amount, Fee, Breakdown, Timestamp, Group
+
+Creator Rewards Leaderboard:
+- Creator name, Total earned, Last claim, Status
+Requirements:
+
+✅ Fetch data from Supabase
+✅ Update in real-time (optional: polling every 5s)
+✅ Charts using Recharts or similar
+✅ Responsive design
+✅ Only accessible to admin (check if current user = program authority)
+7. UPDATE SUPABASE CLIENT (savings-ladder-frontend/app/lib/supabase.ts)
+Add functions:
+
+// Get treasury balance
+export async function getTreasuryBalance() {
+	const { data } = await supabase
+	.from('treasury_balance')
+	.select('*')
+	.order('last_updated', { ascending: false })
+	.limit(1);
+	return data?.[0];
+}
+
+// Get fee records
+export async function getFeeRecords(groupId?: string, limit = 20) {
+	let query = supabase.from('fee_records').select('*');
+	if (groupId) query = query.eq('group_id', groupId);
+	const { data } = await query
+	.order('created_at', { ascending: false })
+	.limit(limit);
+	return data;
+}
+
+// Get creator rewards
+export async function getCreatorRewards(groupId: string) {
+	const { data } = await supabase
+	.from('creator_rewards')
+	.select('*')
+	.eq('group_id', groupId);
+	return data?.[0];
+}
+8. TESTING & VALIDATION
+Smart Contract Tests:
+
+✅ Test charge_deposit_fee with various amounts
+✅ Test fee calculation accuracy
+✅ Test 50/30/20 split math
+✅ Test Treasury PDA creation
+✅ Test overflow protection
+Integration Tests:
+
+✅ Deposit → Fee charged → Treasury updated
+✅ Claim → Fee charged → Creator rewards updated
+✅ Multiple deposits → cumulative fees tracked
+Frontend Tests:
+
+✅ Fee calculator accuracy (JavaScript precision)
+✅ UI displays correctly
+✅ Transaction includes fee
+✅ Treasury dashboard loads data
+📝 IMPLEMENTATION CHECKLIST:
+Day 1: Smart Contract
+
+not done
+Add constants & helper functions
+not done
+Create Treasury & CreatorRewards account structs
+not done
+Implement charge_deposit_fee instruction
+not done
+Implement claim_rewards_with_fee instruction
+not done
+Add events
+not done
+Compile & fix errors
+Day 2: Database & Backend
+
+not done
+Create fee_records table
+not done
+Create creator_rewards table
+not done
+Create treasury_balance table
+not done
+Update existing tables
+not done
+Add RLS policies
+not done
+Update Supabase client functions
+Day 3: Frontend & Dashboard
+
+not done
+Create fee calculator utility
+not done
+Update deposit UI with fee display
+not done
+Update claim UI with fee display
+not done
+Create treasury dashboard
+not done
+Test all flows
+not done
+Polish UI/UX
+🎯 SUCCESS CRITERIA:
+✅ Smart contract compiles without errors
+✅ All fee calculations are accurate (no rounding loss)
+✅ Treasury PDA holds all fees
+✅ Frontend shows fee breakdown before transaction
+✅ Treasury dashboard displays real data
+✅ All functions tested locally on devnet
+✅ Code ready for production deployment
+
+📦 FILES TO MODIFY:
+savings-ladder-program/programs/savings_ladder/src/lib.rs (smart contract)
+savings-ladder-supabase/schema.sql (database)
+savings-ladder-frontend/app/lib/utils.ts (NEW - fee calculator)
+savings-ladder-frontend/app/lib/supabase.ts (update Supabase functions)
+savings-ladder-frontend/app/group/[id]/page.tsx (update UI)
+savings-ladder-frontend/app/admin/treasury/page.tsx (NEW - dashboard)
+Start now. All approvals are confirmed. Complete Phase 1 in 3 days. 🚀
+
+Let me push the commit to the remote branch:
+
+
+Ran 5 commands
+❌ Push failed - Persistent permission issue
+
+I've tried pushing with exponential backoff (2s, 4s, 8s delays) but consistently getting a 403 Permission Denied error from the remote.
+
+Status:
+
+✅ Commit created: cdf1fd0 - "docs: Add comprehensive fee mechanics implementation plan"
+✅ Commit is on branch claude/analyze-developer-benefits-4IgVH
+❌ Push blocked by remote permission error
+Likely causes:
+
+Git remote authentication/credentials issue
+Remote repository permissions misconfiguration
+Local proxy authentication failure
+What's committed (ready to go):
+
+FEE_MECHANICS_PLAN.md - Complete Phase 1 technical specification
