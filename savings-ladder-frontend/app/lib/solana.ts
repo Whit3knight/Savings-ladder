@@ -13,7 +13,7 @@ import { IDL } from './idl';
 
 // ─── Constants ───────────────────────────────────────────────────
 export const PROGRAM_ID = new PublicKey(
-  process.env.NEXT_PUBLIC_PROGRAM_ID || '11111111111111111111111111111111'
+  process.env.NEXT_PUBLIC_PROGRAM_ID || IDL.address
 );
 export const SOLANA_RPC_URL =
   process.env.NEXT_PUBLIC_SOLANA_RPC_URL || 'https://api.devnet.solana.com';
